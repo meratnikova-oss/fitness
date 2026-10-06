@@ -261,10 +261,10 @@ function logErr(where, e){
 window.addEventListener("error", ev => logErr("Скрипт", ev.error || ev.message));
 window.addEventListener("unhandledrejection", ev => logErr("Промис", ev.reason));
 
-const APP_VERSION = "1.3";
+const APP_VERSION = "1.4";
 const saveProgram = () => store.put("program", null, st.program);
 const saveSettings = () => store.put("settings", null, st.settings);
-const saveWorkout = d => { const w = st.workouts[d]; const empty = !w || (!w.entries?.length && !w.dayId); if (empty) delete st.workouts[d]; return store.put("workouts", d, empty ? null : w); };
+const saveWorkout = d => { const w = st.workouts[d]; const empty = !w || (!w.entries?.length && !w.dayId && !w.list?.length); if (empty) delete st.workouts[d]; return store.put("workouts", d, empty ? null : w); };
 const saveActivity = d => { const a = st.activity[d]; if (a && !a.steps && !a.cardio?.length) delete st.activity[d]; return store.put(); };
 const CARDIO = ["Ходьба", "Бег", "Велосипед", "Эллипс", "Настольный теннис", "Плавание", "Другое"];
 const saveNutrition = d => { const n = st.nutrition[d]; if (n && !n.items?.length) delete st.nutrition[d]; return store.put("nutrition", d, st.nutrition[d] || null); };
@@ -511,6 +511,38 @@ async function parseVoice(text){
   st.busy.voice = false; render();
 }
 
+async function getReview(){
+  if (!(await needAI())) return;
+  const w = st.workouts[st.date]; if (!w) return;
+  const plan = planForDate(st.date);
+  const today = (w.entries || []).filter(e => e.sets?.length).map(e => `${e.name}: ${e.sets.map(s => `${s.w ?? "без веса"}×${s.r}`).join(", ")}`).join("\n");
+  const prog = st.program.days.map(d => `${d.name}: ${d.exercises.map(e => `${e.name} ${e.sets}×${e.reps}`).join("; ")}`).join("\n");
+  const since = new Date(fromIso(st.date)); since.setDate(since.getDate() - 14);
+  const recent = Object.keys(st.workouts).sort().filter(d => d < st.date && d >= iso(since)).map(d => `${d}: ${(st.workouts[d].entries || []).filter(e => e.sets?.length).map(e => e.name).join(", ")}`).filter(l => !l.endsWith(": ")).join("\n");
+  st.busy.review = true; render();
+  try{
+    const res = await aiJSON(`Ты опытный тренер по силовым тренировкам. Клиентка тренируется 3 раза в неделю по программе тренера, ещё играет в настольный теннис. Цель: рекомпозиция тела, подтянутый вид.
+Разбери сегодняшнюю тренировку (${plan ? "по плану «" + plan.name + "»" : "без плана"}): какие мышцы нагружены основные и вспомогательные, коротко оцени объём и баланс, и дай 2–4 конкретных совета, что добавить или изменить (упражнение, подходы, повторы, вес), учитывая остальную программу недели, чтобы не дублировать и не перегружать одни и те же мышцы. Пиши просто и по-русски, без медицинских советов и без приветствий.
+Верни ТОЛЬКО JSON: {"summary":"2–3 предложения","muscles":[{"name":"Ягодичные","role":"main"},{"name":"Задняя поверхность бедра","role":"secondary"}],"suggestions":["совет 1","совет 2"]}
+
+Сегодня (вес×повторы):
+${today}
+
+Вся программа:
+${prog}
+
+Тренировки за 2 недели до этого:
+${recent || "нет данных"}`);
+    w.review = {
+      at: Date.now(), summary: String(res?.summary || ""),
+      muscles: (res?.muscles || []).map(m => ({ name: String(m.name || ""), role: m.role === "main" ? "main" : "secondary" })).filter(m => m.name),
+      suggestions: (res?.suggestions || []).map(String).filter(Boolean).slice(0, 5)
+    };
+    saveWorkout(st.date);
+  }catch(e){ aiErr(e); }
+  st.busy.review = false; render();
+}
+
 async function getAdvice(){
   if (!(await needAI())) return;
   const names = allExerciseNames().filter(n => history(n).length);
@@ -607,29 +639,70 @@ function dateNav(){
   <button class="icon-btn" data-act="day" data-d="1" aria-label="Следующий день">${I.right}</button></div>`;
 }
 
+function todayList(d){
+  const w = st.workouts[d], plan = planForDate(d);
+  const base = w?.list ? w.list.map(e => Object.assign({}, e))
+    : (plan?.exercises || []).map(e => ({ name: e.name, sets: e.sets, reps: e.reps, weight: e.weight, note: e.note }));
+  (w?.entries || []).forEach(e => { if (!base.find(x => key(x.name) === key(e.name))) base.push({ name: e.name, sets: null, reps: "", weight: null, note: "" }); });
+  return base;
+}
+function ensureList(d){ const w = ensureWorkout(d); if (!w.list) w.list = todayList(d); return w; }
+function listDiffers(w, plan){
+  if (!w?.list || !plan) return false;
+  const sig = a => JSON.stringify(a.map(e => [key(e.name), Number(e.sets) || 0, String(e.reps || ""), e.note || ""]));
+  return sig(w.list) !== sig(plan.exercises);
+}
+function viewReview(w){
+  const done = (w?.entries || []).some(e => e.sets?.length);
+  if (!done) return "";
+  const r = w.review;
+  return `<div class="card"><h2>Разбор тренировки</h2>
+    ${r ? `${r.summary ? `<p style="margin:8px 0 10px">${esc(r.summary)}</p>` : ""}
+      ${r.muscles?.length ? `<div class="small muted" style="margin-bottom:6px">Какие мышцы работали</div>
+        <div class="sets" style="margin:0 0 12px">${r.muscles.map(m => `<span class="chip" style="padding:6px 12px;${m.role === "main" ? "background:var(--accent-soft)" : ""}">${esc(m.name)}${m.role === "main" ? "" : '<span class="muted" style="font-weight:500">&nbsp;· вспомогательные</span>'}</span>`).join("")}</div>` : ""}
+      ${r.suggestions?.length ? `<div class="small muted" style="margin-bottom:4px">Что можно добавить или изменить</div>
+        <ul style="margin:0 0 6px;padding-left:20px">${r.suggestions.map(s => `<li style="margin:4px 0">${esc(s)}</li>`).join("")}</ul>` : ""}`
+      : `<p class="small muted" style="margin:6px 0 12px">Когда закончите, ИИ посмотрит, какие мышцы вы нагрузили, и подскажет, что добавить или поменять с учётом всей программы.</p>`}
+    <button class="btn ${r ? "ghost" : ""}" data-act="review" ${st.busy.review ? "disabled" : ""}>${st.busy.review ? '<span class="spin"></span> Анализирую' : r ? "Обновить разбор" : "Завершить и получить разбор"}</button>
+  </div>`;
+}
+
 function viewToday(){
   const w = st.workouts[st.date], plan = planForDate(st.date);
-  const planEx = plan?.exercises || [];
   const logged = w?.entries || [];
-  const list = planEx.map(e => ({ name: e.name, pe: e }));
-  logged.forEach(e => { if (!list.find(x => key(x.name) === key(e.name))) list.push({ name: e.name, pe: null }); });
+  const list = todayList(st.date);
   const opts = st.program.days.map(d => `<option value="${d.id}" ${plan?.id === d.id ? "selected" : ""}>${esc(d.name)}</option>`).join("");
-  const cards = list.map((x, i) => {
+  const cards = list.map(x => {
     const e = logged.find(l => key(l.name) === key(x.name));
+    const editing = st.editEx === key(x.name);
+    if (editing) return `<div class="card" data-ex="${esc(x.name)}" style="box-shadow:0 0 0 2px var(--accent)">
+      <label class="lbl" for="exname">Упражнение</label><input class="f" id="exname" value="${esc(x.name)}" style="margin-bottom:8px">
+      <div class="row"><div class="grow"><label class="lbl" for="exsets">Подходы</label><input class="f" id="exsets" inputmode="numeric" value="${esc(x.sets ?? "")}"></div>
+        <div class="grow"><label class="lbl" for="exreps">Повторы</label><input class="f" id="exreps" value="${esc(x.reps ?? "")}"></div></div>
+      <label class="lbl" for="exnote" style="margin-top:8px">Пометка</label><input class="f" id="exnote" value="${esc(x.note || "")}" placeholder="например, узкая постановка">
+      <div class="row wrap" style="margin-top:12px"><button class="btn sm" data-act="exsave">Готово</button><button class="btn sm line" data-act="excancel">Отмена</button><button class="btn sm ghost" data-act="exremove" style="color:var(--danger)">Убрать из тренировки</button></div>
+    </div>`;
     const sg = suggest(x.name, st.date);
+    const es = st.editSet && st.editSet.k === key(x.name) ? st.editSet : null;
     const lastSet = e?.sets?.[e.sets.length - 1];
-    const wVal = lastSet?.w ?? sg?.weight ?? x.pe?.weight ?? "";
-    const rVal = lastSet?.r ?? targetReps(x.pe?.reps) ?? "";
+    const src = es ? e?.sets?.[es.i] : null;
+    const wVal = src ? src.w : (lastSet?.w ?? sg?.weight ?? x.weight ?? "");
+    const rVal = src ? src.r : (lastSet?.r ?? targetReps(x.reps) ?? "");
+    const target = x.sets ? `${esc(x.sets)} × ${esc(x.reps)}${x.weight ? `, по плану ${fmt(x.weight)} кг` : ""}${x.note ? `. ${esc(x.note)}` : ""}` : (x.note ? esc(x.note) : "");
     return `<div class="card" data-ex="${esc(x.name)}">
-      <div class="ex-head"><div><h2>${esc(x.name)}</h2>
-        ${x.pe ? `<div class="ex-target">${esc(x.pe.sets)} × ${esc(x.pe.reps)}${x.pe.weight ? `, по плану ${fmt(x.pe.weight)} кг` : ""}${x.pe.note ? `. ${esc(x.pe.note)}` : ""}</div>` : ""}</div>
-        ${e?.sets?.length ? `<div class="big" aria-label="Подходов">${e.sets.length}<small>${x.pe ? "из " + esc(x.pe.sets) : "подх."}</small></div>` : ""}</div>
-      ${sg ? `<p class="hint ${sg.action === "up" ? "up" : ""}">${esc(sg.text)}</p>` : ""}
-      ${e?.sets?.length ? `<div class="sets">${e.sets.map((s, j) => `<span class="chip"><b>${fmt(s.w)}</b>&nbsp;кг × ${esc(s.r)}<button class="x" data-act="delset" data-i="${j}" aria-label="Удалить подход">×</button></span>`).join("")}</div>` : ""}
-      <div class="addset"><input class="f num" inputmode="decimal" aria-label="Вес, кг" data-w value="${esc(wVal === "" ? "" : fmt(wVal))}" placeholder="кг"><span>кг ×</span>
-        <input class="f num" inputmode="numeric" aria-label="Повторы" data-r value="${esc(rVal)}" placeholder="повт."><button class="btn sm" data-act="addset">Записать подход</button></div>
+      <div class="ex-head"><div class="grow"><h2>${esc(x.name)}</h2>
+        ${target ? `<div class="ex-target">${target}</div>` : ""}
+        <button class="x" data-act="exedit" style="font-size:14px;padding:4px 0;color:var(--accent);font-weight:700">Изменить</button></div>
+        ${e?.sets?.length ? `<div class="big" aria-label="Подходов">${e.sets.length}<small>${x.sets ? "из " + esc(x.sets) : "подх."}</small></div>` : ""}</div>
+      ${sg && !es ? `<p class="hint ${sg.action === "up" ? "up" : ""}">${esc(sg.text)}</p>` : ""}
+      ${e?.sets?.length ? `<div class="sets">${e.sets.map((s, j) => `<span class="chip" ${es && es.i === j ? 'style="box-shadow:0 0 0 2px var(--accent)"' : ""}><button class="x" data-act="editset" data-i="${j}" style="color:inherit;font-size:15px;padding:0" aria-label="Изменить подход">${s.w == null ? "без веса" : `<b>${fmt(s.w)}</b>&nbsp;кг`} × ${esc(s.r)}</button><button class="x" data-act="delset" data-i="${j}" aria-label="Удалить подход">×</button></span>`).join("")}</div>
+        ${es ? "" : `<div class="small muted" style="margin-top:6px">Нажмите на подход, чтобы исправить его</div>`}` : ""}
+      <div class="addset"><input class="f num" inputmode="decimal" aria-label="Вес, кг" data-w value="${esc(wVal === "" || wVal == null ? "" : fmt(wVal))}" placeholder="кг"><span>кг ×</span>
+        <input class="f num" inputmode="numeric" aria-label="Повторы" data-r value="${esc(rVal ?? "")}" placeholder="повт.">
+        <button class="btn sm" data-act="addset">${es ? "Сохранить подход" : "Записать подход"}</button>${es ? `<button class="btn sm line" data-act="setcancel">Отмена</button>` : ""}</div>
     </div>`;
   }).join("");
+  const differs = listDiffers(w, plan);
 
   return `<h1>Тренировка</h1>${dateNav()}
   <div class="card voice">
@@ -640,10 +713,14 @@ function viewToday(){
   </div>
   ${st.program.days.length ? `<label class="lbl" for="pickday">Тренировка по программе</label>
   <select class="f" id="pickday" data-act="pickday" style="margin-bottom:12px"><option value="">Без программы</option>${opts}</select>` : ""}
+  ${differs ? `<div class="card" style="background:var(--lav-soft);box-shadow:none;border:0"><b>Сегодня упражнения отличаются от программы</b>
+    <p class="small muted" style="margin:4px 0 10px">Сохранить изменения в «${esc(plan.name)}», чтобы в следующий раз было так же?</p>
+    <div class="row wrap"><button class="btn sm" data-act="savetoprog">Сохранить в программу</button><button class="btn sm line" data-act="resetlist">Вернуть как в программе</button></div></div>` : ""}
   ${cards || `<div class="card empty"><h2>${st.program.days.length ? "На этот день ничего не запланировано" : "Программы пока нет"}</h2>
-    <p>${st.program.days.length ? "Выберите тренировку выше или надиктуйте подходы." : "Загрузите скриншот программы, и упражнения появятся здесь."}</p>
+    <p>${st.program.days.length ? "Выберите тренировку выше, добавьте упражнение ниже или надиктуйте подходы." : "Загрузите скриншот программы, и упражнения появятся здесь."}</p>
     ${st.program.days.length ? "" : `<button class="btn" data-act="go" data-tab="program">Добавить программу</button>`}</div>`}
-  ${list.length ? `<div class="card"><label class="lbl" for="newex">Другое упражнение</label><div class="row"><input class="f grow" id="newex" placeholder="Название"><button class="btn sm ghost" data-act="newex">Добавить</button></div></div>` : ""}
+  <div class="card"><label class="lbl" for="newex">Добавить упражнение</label><div class="row"><input class="f grow" id="newex" placeholder="Название"><button class="btn sm ghost" data-act="newex">Добавить</button></div></div>
+  ${viewReview(w)}
   ${viewActivity()}`;
 }
 
@@ -871,7 +948,7 @@ document.addEventListener("click", async ev => {
   const b = ev.target.closest("[data-act]"); if (!b || b.tagName === "SELECT" || b.tagName === "INPUT") return;
   const a = b.dataset.act;
   if (a === "go"){ st.tab = b.dataset.tab; render(); scrollTo(0, 0); return; }
-  if (a === "day"){ st.foodMsg = ""; const d = fromIso(st.date); d.setDate(d.getDate() + Number(b.dataset.d)); st.date = iso(d); render(); return; }
+  if (a === "day"){ st.foodMsg = ""; st.editEx = null; st.editSet = null; const d = fromIso(st.date); d.setDate(d.getDate() + Number(b.dataset.d)); st.date = iso(d); render(); return; }
   if (a === "mon"){ const d = fromIso(st.calMonth); d.setMonth(d.getMonth() + Number(b.dataset.d)); st.calMonth = iso(d).slice(0, 7) + "-01"; render(); return; }
   if (a === "calday"){ st.date = b.dataset.d; st.tab = "today"; render(); scrollTo(0, 0); return; }
   if (a === "mic"){ toggleMic(); return; }
@@ -883,15 +960,44 @@ document.addEventListener("click", async ev => {
     const wk = ensureWorkout(st.date);
     let e = wk.entries.find(x => key(x.name) === key(name));
     if (!e){ e = { name, sets: [] }; wk.entries.push(e); }
-    e.sets.push({ w, r: r || 0 }); render(); saveWorkout(st.date); return;
+    if (st.editSet && st.editSet.k === key(name) && e.sets[st.editSet.i]){ e.sets[st.editSet.i] = { w, r: r || 0 }; st.editSet = null; toast("Подход исправлен"); }
+    else e.sets.push({ w, r: r || 0 });
+    render(); saveWorkout(st.date); return;
   }
+  if (a === "editset"){ st.editSet = { k: key(b.closest("[data-ex]").dataset.ex), i: Number(b.dataset.i) }; st.editEx = null; render(); return; }
+  if (a === "setcancel"){ st.editSet = null; render(); return; }
+  if (a === "exedit"){ st.editEx = key(b.closest("[data-ex]").dataset.ex); st.editSet = null; render(); $("#exname")?.focus(); return; }
+  if (a === "excancel"){ st.editEx = null; render(); return; }
+  if (a === "exsave" || a === "exremove"){
+    const old = b.closest("[data-ex]").dataset.ex, wk = ensureList(st.date);
+    const idx = wk.list.findIndex(x => key(x.name) === key(old));
+    const entry = wk.entries.find(x => key(x.name) === key(old));
+    if (a === "exremove"){
+      if (entry?.sets?.length && !confirm("У этого упражнения уже есть записанные подходы. Убрать вместе с ними?")) return;
+      if (idx >= 0) wk.list.splice(idx, 1);
+      wk.entries = wk.entries.filter(x => x !== entry);
+    } else {
+      const name = $("#exname").value.trim(); if (!name){ toast("Введите название"); return; }
+      const item = { name, sets: parseInt($("#exsets").value, 10) || null, reps: $("#exreps").value.trim(), note: $("#exnote").value.trim(), weight: idx >= 0 ? wk.list[idx].weight : null };
+      if (idx >= 0) wk.list[idx] = item; else wk.list.push(item);
+      if (entry) entry.name = name;
+    }
+    st.editEx = null; render(); saveWorkout(st.date); return;
+  }
+  if (a === "savetoprog"){
+    const plan = planForDate(st.date), wk = st.workouts[st.date]; if (!plan || !wk?.list) return;
+    plan.exercises = wk.list.map(x => { const old = plan.exercises.find(e => key(e.name) === key(x.name)); return { id: old?.id || uid(), name: x.name, sets: Number(x.sets) || 0, reps: String(x.reps || ""), weight: x.weight ?? old?.weight ?? null, note: x.note || "" }; });
+    delete wk.list; render(); saveProgram(); saveWorkout(st.date); toast("Программа обновлена"); return;
+  }
+  if (a === "resetlist"){ const wk = st.workouts[st.date]; if (wk){ delete wk.list; render(); saveWorkout(st.date); } return; }
+  if (a === "review"){ getReview(); return; }
   if (a === "delset"){
     const name = b.closest("[data-ex]").dataset.ex, wk = st.workouts[st.date];
     const e = wk?.entries.find(x => key(x.name) === key(name)); if (!e) return;
     e.sets.splice(Number(b.dataset.i), 1); if (!e.sets.length) wk.entries = wk.entries.filter(x => x !== e);
     render(); saveWorkout(st.date); return;
   }
-  if (a === "newex"){ const v = $("#newex").value.trim(); if (!v) return; const wk = ensureWorkout(st.date); if (!wk.entries.find(x => key(x.name) === key(v))) wk.entries.push({ name: v, sets: [] }); render(); return; }
+  if (a === "newex"){ const v = $("#newex").value.trim(); if (!v) return; const wk = ensureList(st.date); if (!wk.list.find(x => key(x.name) === key(v))) wk.list.push({ name: v, sets: 3, reps: "10", weight: null, note: "" }); render(); saveWorkout(st.date); return; }
   if (a === "pasteopen"){ st.pasteOpen = true; render(); $("#ptext")?.focus(); return; }
   if (a === "pasteparse"){ st.pasteText = $("#ptext").value; if (!st.pasteText.trim()){ toast("Вставьте текст программы"); return; } recognizeShots(null, st.pasteText); return; }
   if (a === "draft"){
@@ -942,7 +1048,7 @@ document.addEventListener("click", async ev => {
 
 document.addEventListener("change", ev => {
   const el = ev.target;
-  if (el.dataset.act === "pickday"){ const wk = ensureWorkout(st.date); wk.dayId = el.value; render(); saveWorkout(st.date); return; }
+  if (el.dataset.act === "pickday"){ const wk = ensureWorkout(st.date); wk.dayId = el.value; delete wk.list; st.editEx = null; st.editSet = null; render(); saveWorkout(st.date); return; }
   if (el.dataset.act === "progex"){ st.progEx = el.value; render(); return; }
   if (el.id === "ttime"){ st.settings.time = el.value || "19:00"; saveSettings(); return; }
   if (el.dataset.act === "restore"){
