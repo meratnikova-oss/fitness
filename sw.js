@@ -1,6 +1,6 @@
 // Офлайн-режим: приложение открывается без интернета.
 // При каждом обновлении приложения увеличивайте номер версии ниже.
-const VERSION = "v3";
+const VERSION = "v4";
 const FILES = ["./", "./index.html", "./manifest.webmanifest", "./icon-192.png", "./icon-512.png"];
 
 self.addEventListener("install", e => {

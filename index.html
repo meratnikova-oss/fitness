@@ -229,16 +229,21 @@ const store = {
   load(){
     try{
       const raw = JSON.parse(localStorage.getItem(LS_KEY) || "null");
-      if (raw){ st.program = raw.program || st.program; Object.assign(st.settings, raw.settings || {}); st.workouts = raw.workouts || {}; st.nutrition = raw.nutrition || {}; st.activity = raw.activity || {}; return true; }
+      if (raw){ st.program = raw.program || st.program; Object.assign(st.settings, raw.settings || {}); st.workouts = raw.workouts || {}; st.nutrition = raw.nutrition || {}; st.activity = raw.activity || {}; st.savedAt = raw.savedAt || 0; return true; }
     }catch(e){ logErr("Чтение данных", e); }
     return false;
   },
   put(){
-    try{ localStorage.setItem(LS_KEY, JSON.stringify({ v: 1, program: st.program, settings: st.settings, workouts: st.workouts, nutrition: st.nutrition, activity: st.activity })); }
-    catch(e){ logErr("Сохранение", e); toast("Не удалось сохранить: память браузера переполнена или запрещена"); }
+    st.savedAt = Date.now();
+    localSave();
+    scheduleSync();
     return Promise.resolve();
   }
 };
+function localSave(){
+  try{ localStorage.setItem(LS_KEY, JSON.stringify(snapshot())); }
+  catch(e){ logErr("Сохранение", e); toast("Не удалось сохранить: память браузера переполнена или запрещена"); }
+}
 const SEED = {"program": {"days": [{"exercises": [{"id": "e11", "name": "Приседания", "note": "Без веса или только гриф", "reps": "20", "sets": 2, "weight": null}, {"id": "e12", "name": "Ягодичный мост", "note": "Свободный вес", "reps": "20", "sets": 3, "weight": null}, {"id": "e13", "name": "Жим ногами", "note": "Узкая постановка", "reps": "30", "sets": 4, "weight": null}, {"id": "e14", "name": "Ягодичный мост в тренажёре", "note": "Широкая постановка ног", "reps": "30", "sets": 3, "weight": null}, {"id": "e15", "name": "Ласточка", "note": "Каждая нога", "reps": "20", "sets": 2, "weight": null}], "id": "d1glutes", "name": "Тренировка 1, ягодицы", "weekdays": [0]}, {"exercises": [{"id": "e21", "name": "Пуловер (канат)", "note": "Отдых 30 сек между подходами", "reps": "15", "sets": 5, "weight": null}, {"id": "e22", "name": "Подтягивание в гравитроне", "note": "", "reps": "12", "sets": 4, "weight": null}, {"id": "e23", "name": "Тяга верхнего блока", "note": "Узкий обратный хват", "reps": "15", "sets": 3, "weight": null}, {"id": "e24", "name": "Горизонтальная тяга", "note": "Узкий обратный хват", "reps": "12", "sets": 3, "weight": null}, {"id": "e25", "name": "Пек-дек задняя дельта", "note": "", "reps": "15", "sets": 4, "weight": null}], "id": "d2back", "name": "Тренировка 2, спина и задняя дельта", "weekdays": [2]}, {"exercises": [{"id": "e31", "name": "Выпады", "note": "В ходьбе, можно без веса", "reps": "200 всего", "sets": 1, "weight": null}, {"id": "e32", "name": "Разгибание голени сидя", "note": "", "reps": "25", "sets": 3, "weight": null}, {"id": "e33", "name": "Жим ногами", "note": "Узкая постановка", "reps": "50", "sets": 4, "weight": null}, {"id": "e34", "name": "Отведение в тренажёре сидя", "note": "", "reps": "30", "sets": 10, "weight": null}], "id": "d3quads", "name": "Тренировка 3, квадрицепс и ягодицы", "weekdays": [4]}]}, "settings": {"targets": {"p": 90, "f": 50, "c": 180}, "time": "19:00"}};
 const conf = {
   get(){ try{ return JSON.parse(localStorage.getItem("fitlog-conf") || "{}"); }catch(e){ return {}; } },
@@ -256,7 +261,7 @@ function logErr(where, e){
 window.addEventListener("error", ev => logErr("Скрипт", ev.error || ev.message));
 window.addEventListener("unhandledrejection", ev => logErr("Промис", ev.reason));
 
-const APP_VERSION = "1.2";
+const APP_VERSION = "1.3";
 const saveProgram = () => store.put("program", null, st.program);
 const saveSettings = () => store.put("settings", null, st.settings);
 const saveWorkout = d => { const w = st.workouts[d]; const empty = !w || (!w.entries?.length && !w.dayId); if (empty) delete st.workouts[d]; return store.put("workouts", d, empty ? null : w); };
@@ -317,6 +322,67 @@ function suggest(name, beforeDate){
 }
 
 /* ---------- AI ---------- */
+/* ---------- cloud sync (Yandex Object Storage via your function) ---------- */
+const sync = { state: "off", at: 0, err: "", ready: false, busy: false, again: false, dirty: false, timer: null, warned: false };
+function snapshot(){ return { v: 1, savedAt: st.savedAt || 0, program: st.program, settings: st.settings, workouts: st.workouts, nutrition: st.nutrition, activity: st.activity }; }
+function hasRecords(d){ return ["workouts","nutrition","activity"].some(k => d && d[k] && Object.keys(d[k]).length); }
+function applyData(d){ st.program = d.program || st.program; Object.assign(st.settings, d.settings || {}); st.workouts = d.workouts || {}; st.nutrition = d.nutrition || {}; st.activity = d.activity || {}; st.savedAt = d.savedAt || 0; }
+// newer wins for program and settings; day records from both sides are kept
+function mergeData(newer, older){
+  const out = JSON.parse(JSON.stringify(newer));
+  ["workouts","nutrition","activity"].forEach(k => { out[k] = Object.assign({}, older[k] || {}, newer[k] || {}); });
+  out.savedAt = Math.max(newer.savedAt || 0, older.savedAt || 0);
+  return out;
+}
+async function callFn(body){
+  const c = conf.get();
+  const r = await fetch(c.url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(Object.assign({ password: c.password }, body)) });
+  let d = null; try{ d = await r.json(); }catch(e){}
+  if (!r.ok){ const e = new Error(d?.error || ("HTTP " + r.status)); e.code = "http_" + r.status; throw e; }
+  return d || {};
+}
+function syncFail(where, e){
+  sync.state = "error"; sync.err = aiMsg(e); logErr("Облако: " + where, e);
+  if (!sync.warned){ sync.warned = true; toast("Не удалось связаться с облаком, данные пока сохраняются в телефоне"); }
+}
+async function syncLoad(){
+  const c = conf.get();
+  if (!c.url || !c.password){ sync.state = "off"; return; }
+  if (sync.busy) return;
+  sync.busy = true; sync.state = "loading"; if (st.tab === "settings") render();
+  let push = false;
+  try{
+    const cloud = (await callFn({ action: "load" })).data;
+    const local = snapshot();
+    if (cloud){
+      const merged = (cloud.savedAt || 0) >= (local.savedAt || 0) ? mergeData(cloud, local) : mergeData(local, cloud);
+      push = JSON.stringify(merged) !== JSON.stringify(cloud);
+      applyData(merged); localSave();
+    } else {
+      push = !!(local.savedAt || hasRecords(local));
+    }
+    sync.ready = true; sync.state = "ok"; sync.at = Date.now(); sync.warned = false;
+  }catch(e){ syncFail("загрузка", e); }
+  sync.busy = false;
+  if (push || (sync.ready && sync.dirty)) await syncPush();
+  render();
+}
+async function syncPush(){
+  const c = conf.get();
+  if (!c.url || !c.password) return;
+  if (!sync.ready){ syncLoad(); return; }      // never overwrite the cloud before reading it
+  if (sync.busy){ sync.again = true; return; }
+  sync.busy = true; sync.state = "saving";
+  try{ await callFn({ action: "save", data: snapshot() }); sync.state = "ok"; sync.at = Date.now(); sync.dirty = false; sync.warned = false; }
+  catch(e){ sync.dirty = true; syncFail("сохранение", e); }
+  sync.busy = false;
+  if (sync.again){ sync.again = false; return syncPush(); }
+  if (st.tab === "settings") render();
+}
+function scheduleSync(){ sync.dirty = true; clearTimeout(sync.timer); sync.timer = setTimeout(syncPush, 1500); }
+document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") syncLoad(); else if (sync.dirty && sync.ready) syncPush(); });
+window.addEventListener("online", () => syncLoad());
+
 /* ---------- AI via your Yandex Cloud function ---------- */
 async function needAI(){
   const c = conf.get();
@@ -764,8 +830,17 @@ function viewSettings(){
     <div class="row wrap" style="margin-top:12px"><button class="btn sm" data-act="saveconf">Сохранить</button><button class="btn sm ghost" data-act="testai" ${st.busy.test ? "disabled" : ""}>${st.busy.test ? '<span class="spin"></span> Проверяю' : "Проверить связь"}</button></div>
     ${st.testMsg ? `<p class="${st.testOk ? "hint up" : "err"}">${esc(st.testMsg)}</p>` : ""}
   </div>
+  <div class="card"><div class="row between"><h2>Облачное сохранение</h2>${conf.get().url ? `<button class="btn sm ghost" data-act="syncnow" ${sync.busy ? "disabled" : ""}>${sync.busy ? '<span class="spin"></span>' : "Синхронизировать"}</button>` : ""}</div>
+    <p class="${sync.state === "error" ? "err" : sync.state === "ok" ? "hint up" : "small muted"}" style="margin:10px 0 0">${
+      sync.state === "off" ? "Включится, когда вы укажете адрес функции и пароль выше." :
+      sync.state === "loading" ? "Загружаю данные из облака…" :
+      sync.state === "saving" ? "Сохраняю в облако…" :
+      sync.state === "ok" ? `Всё сохранено в облаке, ${new Date(sync.at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}` :
+      esc(sync.err || "Нет связи с облаком")}</p>
+    <p class="small muted" style="margin:10px 0 0">Данные сохраняются в ваш Yandex Cloud после каждого изменения и загружаются при открытии приложения, поэтому переживут обновления, переустановку и смену телефона.</p>
+  </div>
   <div class="card"><h2>Резервная копия</h2>
-    <p class="small muted" style="margin:4px 0 12px">Все данные хранятся только в этом браузере. Сохраняйте копию раз в пару недель, а при смене телефона загрузите её обратно.</p>
+    <p class="small muted" style="margin:4px 0 12px">Файл со всеми данными на всякий случай. Пригодится, если облако не настроено или нужно перенести данные вручную.</p>
     <div class="row wrap"><button class="btn sm" data-act="backup">Скачать копию</button>
     <label class="btn sm ghost filebtn">Загрузить копию<input type="file" accept=".json,application/json" data-act="restore"></label></div>
   </div>
@@ -850,14 +925,15 @@ document.addEventListener("click", async ev => {
     saveActivity(st.date); render(); return;
   }
   if (a === "delcardio"){ const act = st.activity[st.date]; if (!act) return; act.cardio = (act.cardio || []).filter(c => c.id !== b.dataset.id); saveActivity(st.date); render(); return; }
-  if (a === "saveconf"){ conf.set({ url: $("#cfurl").value.trim(), password: $("#cfpw").value }); st.testMsg = ""; toast("Сохранено"); render(); return; }
+  if (a === "saveconf"){ conf.set({ url: $("#cfurl").value.trim(), password: $("#cfpw").value }); st.testMsg = ""; toast("Сохранено"); sync.ready = false; render(); syncLoad(); return; }
+  if (a === "syncnow"){ syncLoad(); return; }
   if (a === "testai"){
     conf.set({ url: $("#cfurl").value.trim(), password: $("#cfpw").value });
     if (!(await needAI())) return;
     st.busy.test = true; st.testMsg = ""; render();
     try{ const r = await aiJSON('Ответь ровно таким JSON: {"ok":true}'); st.testOk = r?.ok === true; st.testMsg = st.testOk ? "Связь есть, ИИ отвечает" : "Функция отвечает, но ответ странный"; }
     catch(e){ logErr("Проверка связи", e); st.testOk = false; st.testMsg = aiMsg(e); }
-    st.busy.test = false; render(); return;
+    st.busy.test = false; render(); if (st.testOk && !sync.ready) syncLoad(); return;
   }
   if (a === "backup"){ downloadFile(`trenirovki-${iso(new Date())}.json`, JSON.stringify({ v: 1, program: st.program, settings: st.settings, workouts: st.workouts, nutrition: st.nutrition, activity: st.activity }, null, 1), "application/json"); return; }
   if (a === "copylog"){ try{ await navigator.clipboard.writeText(LOG.join("\n")); toast("Журнал скопирован"); }catch(e){ toast("Выделите текст журнала и скопируйте вручную"); } return; }
@@ -897,9 +973,11 @@ document.addEventListener("input", ev => { if (ev.target.id === "vtext") st.voic
   if (!store.load()){
     st.program = structuredClone(SEED.program);
     Object.assign(st.settings, structuredClone(SEED.settings));
-    store.put();
+    st.savedAt = 0; localSave();
   }
   render();
+  try{ navigator.storage?.persist?.(); }catch(e){}
+  syncLoad();
   if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(e => logErr("Офлайн-режим", e));
 })();
 </script>
