@@ -262,10 +262,10 @@ function logErr(where, e){
 window.addEventListener("error", ev => logErr("Скрипт", ev.error || ev.message));
 window.addEventListener("unhandledrejection", ev => logErr("Промис", ev.reason));
 
-const APP_VERSION = "1.5";
+const APP_VERSION = "1.6";
 const saveProgram = () => store.put("program", null, st.program);
 const saveSettings = () => store.put("settings", null, st.settings);
-const saveWorkout = d => { const w = st.workouts[d]; const empty = !w || (!w.entries?.length && !w.dayId && !w.list?.length); if (empty) delete st.workouts[d]; return store.put("workouts", d, empty ? null : w); };
+const saveWorkout = d => { const w = st.workouts[d]; const empty = !w || (!w.entries?.length && !w.dayId && !w.list?.length && !w.aiPlan); if (empty) delete st.workouts[d]; return store.put("workouts", d, empty ? null : w); };
 const saveActivity = d => { const a = st.activity[d]; if (a && !a.steps && !a.cardio?.length) delete st.activity[d]; return store.put(); };
 const CARDIO = ["Ходьба", "Бег", "Велосипед", "Эллипс", "Настольный теннис", "Плавание", "Другое"];
 const saveNutrition = d => { const n = st.nutrition[d]; if (n && !n.items?.length) delete st.nutrition[d]; return store.put("nutrition", d, st.nutrition[d] || null); };
@@ -769,6 +769,75 @@ function viewReview(w){
   </div>`;
 }
 
+/* ---------- AI plan for the day ---------- */
+function dayPlanItem(d, name){ return (st.workouts[d]?.aiPlan?.items || []).find(i => key(i.exercise) === key(name)); }
+function viewDayPlan(){
+  const list = todayList(st.date);
+  if (!list.length) return "";
+  const ap = st.workouts[st.date]?.aiPlan;
+  return `<div class="card" style="background:var(--lav-soft);border:0;box-shadow:none">
+    <div class="row between"><h2>Совет ИИ на сегодня</h2>${ap ? `<span class="small muted">${new Date(ap.at).toLocaleTimeString("ru-RU", { hour: "2-digit", minute: "2-digit" })}</span>` : ""}</div>
+    ${ap ? `${ap.summary ? `<p style="margin:8px 0 6px">${esc(ap.summary)}</p>` : ""}
+      ${ap.items.map(i => `<div class="item"><div class="grow"><b>${esc(i.exercise)}</b>
+        <div class="small">${i.sets ? esc(i.sets) + " × " : ""}${esc(i.reps || "")}${i.weight != null ? `, <b>${fmt(i.weight)} кг</b>` : ""}</div>
+        ${i.note ? `<div class="small muted">${esc(i.note)}</div>` : ""}</div></div>`).join("")}`
+      : `<p class="small muted" style="margin:6px 0 10px">ИИ посмотрит прошлые тренировки, шаги и кардио за неделю и ваши ограничения из профиля и подскажет веса, повторы и на что обратить внимание сегодня.</p>`}
+    <button class="btn ${ap ? "ghost" : ""}" style="margin-top:8px" data-act="dayplan" ${st.busy.dayplan ? "disabled" : ""}>${st.busy.dayplan ? '<span class="spin"></span> Готовлю совет' : ap ? "Обновить совет" : "Получить совет на сегодня"}</button>
+  </div>`;
+}
+async function getDayPlan(d, silent){
+  const c = conf.get();
+  if (!c.url || !c.password){ if (!silent) await needAI(); return; }
+  const list = todayList(d); if (!list.length) return;
+  const exLines = list.map(x => {
+    const h = history(x.name, d).slice(-4).map(s => `${s.date}: ${s.sets.map(t => `${t.w ?? "без веса"}×${t.r}`).join(", ")}`).join("; ");
+    const rc = recFor(x.name);
+    return `- ${x.name}: план ${x.sets || "?"}×${x.reps || "?"}${x.note ? " (" + x.note + ")" : ""}. История: ${h || "нет"}${rc ? `. Рекомендация к программе: ${rc.weight ?? "—"} кг, риск ${rc.risk}` : ""}`;
+  }).join("\n");
+  const week = [];
+  for (let i = 7; i >= 1; i--){
+    const x = new Date(fromIso(d)); x.setDate(x.getDate() - i); const k = iso(x);
+    const w = st.workouts[k], a = st.activity[k];
+    const parts = [];
+    const done = (w?.entries || []).filter(e => e.sets?.length).map(e => e.name);
+    if (done.length) parts.push("силовая: " + done.join(", "));
+    if (a?.steps) parts.push(a.steps + " шагов");
+    if (a?.cardio?.length) parts.push("кардио: " + a.cardio.map(cc => `${cc.type} ${cc.min} мин`).join(", "));
+    if (parts.length) week.push(`${k}: ${parts.join("; ")}`);
+  }
+  st.busy.dayplan = true; render();
+  try{
+    const res = await aiJSON(`Ты опытный тренер по силовым тренировкам. Клиентка (39 лет) тренируется по программе своего тренера 3 раза в неделю, играет в настольный теннис. Цель: рекомпозиция тела, подтянутый вид.
+Составь рекомендации на СЕГОДНЯШНЮЮ тренировку (${d}). Для каждого упражнения: подходы, повторы и рабочий вес в кг. Используй двойную прогрессию: если в прошлый раз все подходы сделаны на верхней границе повторов, добавь вес (2,5 кг для базовых, 1–2 кг для гантелей и тренажёров), иначе оставь вес и добирай повторы. Если истории нет, weight = null и в note напиши, как подобрать вес. Учитывай травмы: где нагрузка на проблемную зону, не повышай вес и напиши, на что обратить внимание. Учитывай нагрузку за последнюю неделю (если накануне была тяжёлая тренировка или много кардио, можно чуть легче).
+В summary 1–3 предложения: общий настрой на тренировку и главное, на что обратить внимание. Пиши коротко и по-русски, без медицинских диагнозов.
+
+Травмы и ограничения:
+${healthText()}
+
+Упражнения на сегодня:
+${exLines}
+
+Последние 7 дней:
+${week.join("\n") || "нет данных"}
+
+Верни ТОЛЬКО JSON: {"summary":"...","items":[{"exercise":"точное название из списка","sets":3,"reps":"12","weight":20,"note":"до 20 слов"}]}`);
+    const items = (res?.items || []).map(i => ({ exercise: String(i.exercise || "").trim(), sets: parseInt(i.sets, 10) || null, reps: String(i.reps ?? "").trim(), weight: num(i.weight), note: String(i.note || "") }))
+      .filter(i => list.some(x => key(x.name) === key(i.exercise)));
+    if (items.length){ const w = ensureWorkout(d); w.aiPlan = { at: Date.now(), summary: String(res?.summary || ""), items }; saveWorkout(d); }
+    else if (!silent) toast("ИИ не смог составить совет, попробуйте ещё раз");
+  }catch(e){ if (silent) logErr("Совет на день", e); else aiErr(e); }
+  st.busy.dayplan = false; render();
+}
+const autoTried = {};
+function maybeAutoDayPlan(){
+  const d = st.date, today = iso(new Date());
+  if (st.tab !== "today" || d !== today || autoTried[d] || st.busy.dayplan) return;
+  const w = st.workouts[d];
+  if (w?.aiPlan || (w?.entries || []).some(e => e.sets?.length) || !todayList(d).length) return;
+  const c = conf.get(); if (!c.url || !c.password || !sync.ready) return;
+  autoTried[d] = true; setTimeout(() => getDayPlan(d, true), 300);
+}
+
 function viewToday(){
   const w = st.workouts[st.date], plan = planForDate(st.date);
   const logged = w?.entries || [];
@@ -788,7 +857,8 @@ function viewToday(){
     const es = st.editSet && st.editSet.k === key(x.name) ? st.editSet : null;
     const lastSet = e?.sets?.[e.sets.length - 1];
     const src = es ? e?.sets?.[es.i] : null;
-    const wVal = src ? src.w : (lastSet?.w ?? sg?.weight ?? x.weight ?? "");
+    const dp = dayPlanItem(st.date, x.name);
+    const wVal = src ? src.w : (lastSet?.w ?? dp?.weight ?? sg?.weight ?? x.weight ?? "");
     const rVal = src ? src.r : (lastSet?.r ?? targetReps(x.reps) ?? "");
     const target = x.sets ? `${esc(x.sets)} × ${esc(x.reps)}${x.weight ? `, по плану ${fmt(x.weight)} кг` : ""}${x.note ? `. ${esc(x.note)}` : ""}` : (x.note ? esc(x.note) : "");
     return `<div class="card" data-ex="${esc(x.name)}">
@@ -796,8 +866,9 @@ function viewToday(){
         ${target ? `<div class="ex-target">${target}</div>` : ""}
         <button class="x" data-act="exedit" style="font-size:14px;padding:4px 0;color:var(--accent);font-weight:700">Изменить</button></div>
         ${e?.sets?.length ? `<div class="big" aria-label="Подходов">${e.sets.length}<small>${x.sets ? "из " + esc(x.sets) : "подх."}</small></div>` : ""}</div>
+      ${dp && !es ? `<p class="hint" style="background:var(--lav-soft)">ИИ на сегодня: ${dp.sets ? esc(dp.sets) + " × " : ""}${esc(dp.reps)}${dp.weight != null ? `, ${fmt(dp.weight)} кг` : ""}${dp.note ? `. ${esc(dp.note)}` : ""}</p>` : ""}
       ${(() => { const rc = recFor(x.name); return rc && rc.risk !== "ok" && !es ? `<p class="hint" style="color:var(--warn)">${rc.risk === "avoid" ? "Лучше заменить" : "Осторожно"}: ${esc(rc.why)}${rc.alternatives?.length ? ` Замены: ${esc(rc.alternatives.join(", "))}.` : ""}</p>` : ""; })()}
-      ${sg && !es ? `<p class="hint ${sg.action === "up" ? "up" : ""}">${esc(sg.text)}</p>` : ""}
+      ${sg && !es && !dp ? `<p class="hint ${sg.action === "up" ? "up" : ""}">${esc(sg.text)}</p>` : ""}
       ${e?.sets?.length ? `<div class="sets">${e.sets.map((s, j) => `<span class="chip" ${es && es.i === j ? 'style="box-shadow:0 0 0 2px var(--accent)"' : ""}><button class="x" data-act="editset" data-i="${j}" style="color:inherit;font-size:15px;padding:0" aria-label="Изменить подход">${s.w == null ? "без веса" : `<b>${fmt(s.w)}</b>&nbsp;кг`} × ${esc(s.r)}</button><button class="x" data-act="delset" data-i="${j}" aria-label="Удалить подход">×</button></span>`).join("")}</div>
         ${es ? "" : `<div class="small muted" style="margin-top:6px">Нажмите на подход, чтобы исправить его</div>`}` : ""}
       <div class="addset"><input class="f num" inputmode="decimal" aria-label="Вес, кг" data-w value="${esc(wVal === "" || wVal == null ? "" : fmt(wVal))}" placeholder="кг"><span>кг ×</span>
@@ -808,6 +879,7 @@ function viewToday(){
   const differs = listDiffers(w, plan);
 
   return `<h1>Тренировка</h1>${dateNav()}
+  ${viewDayPlan()}
   <div class="card voice">
     <div class="row"><button class="mic" id="mic" data-act="mic" aria-label="Надиктовать">${I.mic}</button>
       <div class="grow small muted">Скажите подходы своими словами: «присед 60 на 8, три подхода, жим гантелей 14 на 12 и 14 на 10»</div></div>
@@ -1047,6 +1119,7 @@ function render(){
     + (st.tab !== "profile" ? `<button class="icon-btn prof-btn" data-act="go" data-tab="profile" aria-label="Мой профиль">${I.user}</button>` : "") + views[st.tab]();
   $("#tabs").innerHTML = `<div class="in">${TABS.map(([k, n]) => `<button class="${st.tab === k ? "on" : ""}" data-act="go" data-tab="${k}" aria-current="${st.tab === k ? "page" : "false"}">${I[k]}${n}</button>`).join("")}</div>`;
   if (focusId && document.getElementById(focusId) && !["vtext"].includes(focusId)) document.getElementById(focusId).focus();
+  maybeAutoDayPlan();
 }
 
 /* ---------- events ---------- */
@@ -1113,6 +1186,7 @@ document.addEventListener("click", async ev => {
     if (m !== "cancel"){ saveProgram(); toast("Программа сохранена, ИИ готовит рекомендации"); const c = conf.get(); if (c.url && c.password) getProgramRecs(); } return;
   }
   if (a === "recs"){ getProgramRecs(); return; }
+  if (a === "dayplan"){ getDayPlan(st.date); return; }
   if (a === "recapply"){ const r = recFor(b.closest("[data-rec]").dataset.rec); if (r){ applyRec(r); saveProgram(); render(); toast("Применено в программе"); } return; }
   if (a === "recswap"){ const from = b.closest("[data-rec]").dataset.rec, to = b.dataset.to; if (!confirm(`Заменить «${from}» на «${to}» во всей программе?`)) return; swapExercise(from, to); saveProgram(); render(); toast("Упражнение заменено"); return; }
   if (a === "hpreset"){ const h = prof().health, n = b.dataset.n, i = h.findIndex(x => key(x.name) === key(n)); if (i >= 0) h.splice(i, 1); else h.push({ id: uid(), name: n, note: "" }); store.put(); render(); return; }
