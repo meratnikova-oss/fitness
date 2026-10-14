@@ -49,7 +49,7 @@ button,input,select,textarea{font:inherit;color:inherit}
 button{cursor:pointer}
 :focus-visible{outline:2px solid var(--accent);outline-offset:2px}
 main{max-width:560px;margin:0 auto;padding:20px 16px 110px}
-h1{font:800 30px/1.1 var(--display);margin:6px 52px 6px 0;letter-spacing:-.02em}
+h1{font:800 30px/1.1 var(--display);margin:6px 104px 6px 0;letter-spacing:-.02em}
 h2{font:700 17px/1.3 var(--body);margin:0}
 .sub{color:var(--muted);margin:0 0 18px;font-size:15px}
 .card{background:var(--surface);border-radius:var(--r-lg);padding:18px;margin:0 0 14px;box-shadow:var(--shadow);border:1px solid var(--line)}
@@ -184,6 +184,7 @@ main{position:relative}
 .bars i{display:block;width:100%;border-radius:8px 8px 4px 4px;background:var(--lav);min-height:3px}
 .bars i.goal{background:var(--accent)}
 .bars span{font-size:11px;color:var(--muted)}
+.prof-btn{position:absolute;right:64px;top:20px}
 .loading{display:grid;place-items:center;height:60vh;color:var(--muted)}
 </style>
 </head>
@@ -229,7 +230,7 @@ const store = {
   load(){
     try{
       const raw = JSON.parse(localStorage.getItem(LS_KEY) || "null");
-      if (raw){ st.program = raw.program || st.program; Object.assign(st.settings, raw.settings || {}); st.workouts = raw.workouts || {}; st.nutrition = raw.nutrition || {}; st.activity = raw.activity || {}; st.savedAt = raw.savedAt || 0; return true; }
+      if (raw){ st.program = raw.program || st.program; Object.assign(st.settings, raw.settings || {}); st.workouts = raw.workouts || {}; st.nutrition = raw.nutrition || {}; st.activity = raw.activity || {}; st.profile = raw.profile || null; st.savedAt = raw.savedAt || 0; return true; }
     }catch(e){ logErr("Чтение данных", e); }
     return false;
   },
@@ -261,7 +262,7 @@ function logErr(where, e){
 window.addEventListener("error", ev => logErr("Скрипт", ev.error || ev.message));
 window.addEventListener("unhandledrejection", ev => logErr("Промис", ev.reason));
 
-const APP_VERSION = "1.4";
+const APP_VERSION = "1.5";
 const saveProgram = () => store.put("program", null, st.program);
 const saveSettings = () => store.put("settings", null, st.settings);
 const saveWorkout = d => { const w = st.workouts[d]; const empty = !w || (!w.entries?.length && !w.dayId && !w.list?.length); if (empty) delete st.workouts[d]; return store.put("workouts", d, empty ? null : w); };
@@ -324,9 +325,9 @@ function suggest(name, beforeDate){
 /* ---------- AI ---------- */
 /* ---------- cloud sync (Yandex Object Storage via your function) ---------- */
 const sync = { state: "off", at: 0, err: "", ready: false, busy: false, again: false, dirty: false, timer: null, warned: false };
-function snapshot(){ return { v: 1, savedAt: st.savedAt || 0, program: st.program, settings: st.settings, workouts: st.workouts, nutrition: st.nutrition, activity: st.activity }; }
+function snapshot(){ return { v: 1, savedAt: st.savedAt || 0, program: st.program, settings: st.settings, workouts: st.workouts, nutrition: st.nutrition, activity: st.activity, profile: st.profile || null }; }
 function hasRecords(d){ return ["workouts","nutrition","activity"].some(k => d && d[k] && Object.keys(d[k]).length); }
-function applyData(d){ st.program = d.program || st.program; Object.assign(st.settings, d.settings || {}); st.workouts = d.workouts || {}; st.nutrition = d.nutrition || {}; st.activity = d.activity || {}; st.savedAt = d.savedAt || 0; }
+function applyData(d){ st.program = d.program || st.program; Object.assign(st.settings, d.settings || {}); st.workouts = d.workouts || {}; st.nutrition = d.nutrition || {}; st.activity = d.activity || {}; st.profile = d.profile || st.profile || null; st.profile = d.profile || st.profile || null; st.savedAt = d.savedAt || 0; }
 // newer wins for program and settings; day records from both sides are kept
 function mergeData(newer, older){
   const out = JSON.parse(JSON.stringify(newer));
@@ -511,6 +512,101 @@ async function parseVoice(text){
   st.busy.voice = false; render();
 }
 
+/* ---------- health profile + AI program recommendations ---------- */
+const HEALTH_PRESETS = ["Грыжа поясничного отдела", "Протрузии поясничного отдела", "Грыжа или протрузии шейного отдела", "Колени", "Плечо", "Тазобедренный сустав", "Голеностоп", "Запястья", "Диастаз", "Давление"];
+function prof(){ const p = (st.profile ||= {}); p.health ||= []; return p; }
+function healthText(){
+  const h = prof().health;
+  return h.length ? h.map(x => `- ${x.name}${x.note ? ": " + x.note : ""}`).join("\n") : "не указаны";
+}
+function recFor(name){ return (st.program.recs?.items || []).find(r => key(r.exercise) === key(name)); }
+
+function viewProfile(){
+  const h = prof().health;
+  return `<h1>Мой профиль</h1>
+  <p class="sub">ИИ учитывает это, когда советует веса, разбирает тренировки и подбирает замены упражнениям.</p>
+  <div class="card"><h2>Травмы и ограничения</h2>
+    <p class="small muted" style="margin:4px 0 10px">Нажмите, что относится к вам, и уточните в пометке: где именно, что болит, что запретил врач.</p>
+    <div class="types">${HEALTH_PRESETS.map(n => { const on = h.some(x => key(x.name) === key(n)); return `<button class="${on ? "on" : ""}" data-act="hpreset" data-n="${esc(n)}" aria-pressed="${on}">${esc(n)}</button>`; }).join("")}</div>
+    <div class="row"><input class="f grow" id="hnew" placeholder="Другое, например «сколиоз»"><button class="btn sm ghost" data-act="hadd">Добавить</button></div>
+    ${h.map(x => `<div class="item" data-hid="${x.id}"><div class="grow"><b>${esc(x.name)}</b>
+      <input class="f" data-hnote value="${esc(x.note || "")}" placeholder="например: L4-L5, болит при наклонах" style="margin-top:6px;min-height:40px;font-size:15px"></div>
+      <button class="x" data-act="hdel" aria-label="Удалить">×</button></div>`).join("")}
+  </div>
+  <p class="small muted">Советы ИИ не заменяют врача и тренера. Если что-то болит во время упражнения, остановитесь.</p>`;
+}
+
+function viewRecs(){
+  const r = st.program.recs;
+  if (!st.program.days.length) return "";
+  const noHealth = !prof().health.length;
+  const tag = k => k === "avoid" ? `<span class="tag down">Лучше заменить</span>` : k === "caution" ? `<span class="tag" style="color:var(--warn)">С осторожностью</span>` : "";
+  return `<div class="card" style="background:var(--lav-soft);border:0;box-shadow:none"><div class="row between"><h2>Рекомендации ИИ</h2>${r ? `<span class="small muted">${human(r.date)}</span>` : ""}</div>
+    ${noHealth ? `<p class="small" style="margin:6px 0 0">Ограничения по здоровью не указаны. <button class="x" data-act="go" data-tab="profile" style="color:var(--accent);font-weight:700;padding:0;font-size:14px">Заполнить профиль</button></p>` : ""}
+    ${r ? `${r.summary ? `<p style="margin:10px 0 4px">${esc(r.summary)}</p>` : ""}
+      ${r.items.map(x => `<div class="advice" data-rec="${esc(x.exercise)}">
+        <div class="row between" style="align-items:flex-start;gap:8px"><b>${esc(x.exercise)}</b>${tag(x.risk)}</div>
+        <div class="small" style="margin-top:2px">Советую: ${x.sets ? esc(x.sets) + " × " : ""}${esc(x.reps || "как в плане")}${x.weight != null ? `, <b>${fmt(x.weight)} кг</b>` : ""}${x.applied ? ' <span class="muted">· применено</span>' : ""}</div>
+        ${x.why ? `<div class="small muted">${esc(x.why)}</div>` : ""}
+        ${x.alternatives?.length ? `<div class="small muted" style="margin-top:6px">Чем заменить:</div><div class="row wrap" style="gap:6px;margin-top:4px">${x.alternatives.map(a => `<button class="btn sm line" data-act="recswap" data-to="${esc(a)}">${esc(a)}</button>`).join("")}</div>` : ""}
+        ${x.applied ? "" : `<button class="btn sm ghost" style="margin-top:8px" data-act="recapply">Применить повторы и вес</button>`}
+      </div>`).join("")}` : `<p class="small muted" style="margin:6px 0 10px">ИИ посмотрит историю ваших тренировок и ограничения из профиля, предложит повторы и рабочие веса и подскажет, чем заменить рискованные упражнения.</p>`}
+    <button class="btn ${r ? "ghost" : ""}" style="margin-top:10px" data-act="recs" ${st.busy.recs ? "disabled" : ""}>${st.busy.recs ? '<span class="spin"></span> Анализирую программу' : r ? "Обновить рекомендации" : "Получить рекомендации"}</button>
+  </div>`;
+}
+
+async function getProgramRecs(){
+  if (!(await needAI())) return;
+  if (!st.program.days.length) return;
+  const prog = st.program.days.map(d => `${d.name}:\n` + d.exercises.map(e => `  ${e.name}: ${e.sets}×${e.reps}${e.weight ? ", " + e.weight + " кг" : ""}${e.note ? " (" + e.note + ")" : ""}`).join("\n")).join("\n");
+  const since = new Date(); since.setDate(since.getDate() - 42);
+  const hist = allExerciseNames().map(n => {
+    const h = history(n).filter(x => x.date >= iso(since)).slice(-4);
+    return h.length ? `${n}: ${h.map(x => `${x.date} ${x.sets.map(s => `${s.w ?? "без веса"}×${s.r}`).join(", ")}`).join("; ")}` : "";
+  }).filter(Boolean).slice(0, 40).join("\n");
+  st.busy.recs = true; render();
+  try{
+    const res = await aiJSON(`Ты опытный тренер по силовым тренировкам. Клиентка (39 лет) тренируется 3 раза в неделю по программе своего тренера, ещё играет в настольный теннис. Цель: рекомпозиция тела, подтянутый вид.
+Ей выдали новую программу. Для КАЖДОГО упражнения программы:
+1) порекомендуй подходы, повторы и рабочий вес в кг на первую неделю. Опирайся на историю последних недель: если было это или похожее упражнение, считай от достигнутого рабочего веса и пересчитай под новое число повторов (больше повторов — меньше вес). Если истории нет, weight = null и в why напиши, как подобрать вес самой (последние 2 повтора даются тяжело, техника не ломается). Повторы и подходы по умолчанию оставляй как у тренера.
+2) оцени риск с учётом травм и ограничений: "ok", "caution" (можно, но с оговорками, напиши какими) или "avoid" (лучше заменить). При "caution" и "avoid" предложи 1–3 замены, которые нагружают те же мышцы безопаснее. При "ok" alternatives = [].
+Не выдумывай данных, пиши коротко и по-русски, без медицинских диагнозов.
+
+Травмы и ограничения:
+${healthText()}
+
+Новая программа:
+${prog}
+
+История подходов за последние недели (вес×повторы):
+${hist || "нет данных"}
+
+Верни ТОЛЬКО JSON: {"summary":"2–3 предложения про программу в целом и на что обратить внимание","items":[{"exercise":"точное название из программы","sets":3,"reps":"12","weight":20,"risk":"ok","why":"до 25 слов","alternatives":[]}]}`);
+    const items = (res?.items || []).map(x => ({
+      exercise: String(x.exercise || "").trim(), sets: parseInt(x.sets, 10) || null, reps: String(x.reps ?? "").trim(),
+      weight: num(x.weight), risk: ["ok","caution","avoid"].includes(x.risk) ? x.risk : "ok", why: String(x.why || ""),
+      alternatives: (x.alternatives || []).map(String).map(s => s.trim()).filter(Boolean).slice(0, 3)
+    })).filter(x => x.exercise && programEx(x.exercise));
+    if (!items.length) toast("ИИ не смог разобрать программу, попробуйте ещё раз");
+    else { st.program.recs = { date: iso(new Date()), summary: String(res?.summary || ""), items }; saveProgram(); }
+  }catch(e){ aiErr(e); }
+  st.busy.recs = false; render();
+}
+function applyRec(r){
+  st.program.days.forEach(d => d.exercises.forEach(e => {
+    if (key(e.name) !== key(r.exercise)) return;
+    if (r.sets) e.sets = r.sets;
+    if (r.reps) e.reps = r.reps;
+    if (r.weight != null) e.weight = r.weight;
+  }));
+  r.applied = true;
+}
+function swapExercise(from, to){
+  st.program.days.forEach(d => d.exercises.forEach(e => { if (key(e.name) === key(from)) { e.name = to; e.weight = null; e.note = (e.note ? e.note + ". " : "") + "Замена: " + from; } }));
+  const r = recFor(from);
+  if (r){ r.exercise = to; r.risk = "ok"; r.alternatives = []; r.weight = null; r.why = `Заменено вместо «${from}». Вес подберите на первой тренировке.`; r.applied = true; }
+}
+
 async function getReview(){
   if (!(await needAI())) return;
   const w = st.workouts[st.date]; if (!w) return;
@@ -532,7 +628,10 @@ ${today}
 ${prog}
 
 Тренировки за 2 недели до этого:
-${recent || "нет данных"}`);
+${recent || "нет данных"}
+
+Травмы и ограничения (учитывай в советах, не предлагай рискованное):
+${healthText()}`);
     w.review = {
       at: Date.now(), summary: String(res?.summary || ""),
       muscles: (res?.muscles || []).map(m => ({ name: String(m.name || ""), role: m.role === "main" ? "main" : "secondary" })).filter(m => m.name),
@@ -557,6 +656,8 @@ async function getAdvice(){
     const res = await aiJSON(
       `Ты опытный тренер по силовым. Цель клиентки: рекомпозиция тела, подтянутый вид; питание и БЖУ ведёт её тренер. Тренировки силовые 3 раза в неделю, плюс настольный теннис.
 По истории подходов (формат вес×повторы) дай рекомендацию по каждому упражнению на следующую тренировку, используя двойную прогрессию: повышать вес, когда все рабочие подходы выполнены на верхней границе повторов; шаг 2,5 кг для базовых, 1–2 кг для изолирующих и гантелей. Если прогресс стоит 3+ тренировки, предложи вариант (меньше вес на больше повторов, разгрузка). Не выдумывай данных.
+Учитывай травмы и ограничения: где нагрузка на проблемную зону, не спеши повышать вес.
+${"Травмы и ограничения:\n" + healthText()}
 Верни ТОЛЬКО JSON: {"summary":"1–2 предложения об общей картине","advice":[{"exercise":"название","action":"up|hold|down","weight":число или null,"why":"коротко, до 20 слов"}]}
 
 ${lines}`);
@@ -627,6 +728,7 @@ const I = {
   mic:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
   left:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>',
   gear:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1.1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg>',
+  user:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/></svg>',
   right:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>'
 };
 const TABS = [["today","Сегодня"],["program","Программа"],["progress","Прогресс"],["food","БЖУ"],["cal","Календарь"]];
@@ -694,6 +796,7 @@ function viewToday(){
         ${target ? `<div class="ex-target">${target}</div>` : ""}
         <button class="x" data-act="exedit" style="font-size:14px;padding:4px 0;color:var(--accent);font-weight:700">Изменить</button></div>
         ${e?.sets?.length ? `<div class="big" aria-label="Подходов">${e.sets.length}<small>${x.sets ? "из " + esc(x.sets) : "подх."}</small></div>` : ""}</div>
+      ${(() => { const rc = recFor(x.name); return rc && rc.risk !== "ok" && !es ? `<p class="hint" style="color:var(--warn)">${rc.risk === "avoid" ? "Лучше заменить" : "Осторожно"}: ${esc(rc.why)}${rc.alternatives?.length ? ` Замены: ${esc(rc.alternatives.join(", "))}.` : ""}</p>` : ""; })()}
       ${sg && !es ? `<p class="hint ${sg.action === "up" ? "up" : ""}">${esc(sg.text)}</p>` : ""}
       ${e?.sets?.length ? `<div class="sets">${e.sets.map((s, j) => `<span class="chip" ${es && es.i === j ? 'style="box-shadow:0 0 0 2px var(--accent)"' : ""}><button class="x" data-act="editset" data-i="${j}" style="color:inherit;font-size:15px;padding:0" aria-label="Изменить подход">${s.w == null ? "без веса" : `<b>${fmt(s.w)}</b>&nbsp;кг`} × ${esc(s.r)}</button><button class="x" data-act="delset" data-i="${j}" aria-label="Удалить подход">×</button></span>`).join("")}</div>
         ${es ? "" : `<div class="small muted" style="margin-top:6px">Нажмите на подход, чтобы исправить его</div>`}` : ""}
@@ -756,6 +859,7 @@ function viewProgram(){
       <button class="btn sm" style="margin-top:8px" data-act="pasteparse" ${st.busy.shot ? "disabled" : ""}>Разобрать текст</button></div>`
       : `<div style="margin-top:10px"><button class="btn line sm" data-act="pasteopen">Вставить текстом</button></div>`}`;
   let html = `<h1>Программа</h1><p class="sub">Отметьте дни недели, чтобы тренировки появились в календаре.</p>`;
+  const recsHtml = st.draft ? "" : viewRecs();
   if (st.draft){
     html += `<div class="card" style="border-color:var(--accent)"><h2>Распознано с картинки</h2><p class="small muted" style="margin:4px 0 10px">Проверьте и сохраните. Потом всё можно поправить.</p>
     ${st.draft.map(d => `<div style="margin:10px 0"><b>${esc(d.name)}</b><div class="small">${d.exercises.map(e => `${esc(e.name)}: ${esc(e.sets)} × ${esc(e.reps)}${e.weight ? `, ${fmt(e.weight)} кг` : ""}`).join("<br>")}</div></div>`).join("")}
@@ -764,6 +868,7 @@ function viewProgram(){
   if (!st.program.days.length && !st.draft){
     return html + `<div class="card empty"><h2>Начните со скриншота</h2><p>Сфотографируйте или заскриньте программу от тренера, ИИ разложит её по дням и упражнениям.</p>${shotBtn}${extra}<div style="margin-top:10px"><button class="btn line sm" data-act="addday">Заполнить вручную</button></div></div>`;
   }
+  html += recsHtml;
   html += st.program.days.map(d => `<div class="card" data-day="${d.id}">
     <div class="row between"><input class="f grow" style="font-weight:700" data-field="dayname" value="${esc(d.name)}" aria-label="Название дня"><button class="x" data-act="delday" aria-label="Удалить день">×</button></div>
     <div class="wd" style="margin-top:10px">${WD.map((n, i) => `<button class="${(d.weekdays || []).includes(i) ? "on" : ""}" data-act="wd" data-i="${i}" aria-pressed="${(d.weekdays || []).includes(i)}">${n}</button>`).join("")}</div>
@@ -935,10 +1040,11 @@ function downloadFile(name, data, type){
 
 function render(){
   const app = $("#app");
-  const views = { today: viewToday, program: viewProgram, progress: viewProgress, food: viewFood, cal: viewCal, settings: viewSettings };
+  const views = { today: viewToday, program: viewProgram, progress: viewProgress, food: viewFood, cal: viewCal, settings: viewSettings, profile: viewProfile };
   const focusId = document.activeElement?.id;
   if (st.tab === "today" && $("#vtext")) st.voiceText = $("#vtext").value;
-  app.innerHTML = (st.tab !== "settings" ? `<button class="icon-btn gear" data-act="go" data-tab="settings" aria-label="Настройки">${I.gear}</button>` : "") + views[st.tab]();
+  app.innerHTML = (st.tab !== "settings" ? `<button class="icon-btn gear" data-act="go" data-tab="settings" aria-label="Настройки">${I.gear}</button>` : "")
+    + (st.tab !== "profile" ? `<button class="icon-btn prof-btn" data-act="go" data-tab="profile" aria-label="Мой профиль">${I.user}</button>` : "") + views[st.tab]();
   $("#tabs").innerHTML = `<div class="in">${TABS.map(([k, n]) => `<button class="${st.tab === k ? "on" : ""}" data-act="go" data-tab="${k}" aria-current="${st.tab === k ? "page" : "false"}">${I[k]}${n}</button>`).join("")}</div>`;
   if (focusId && document.getElementById(focusId) && !["vtext"].includes(focusId)) document.getElementById(focusId).focus();
 }
@@ -1003,8 +1109,15 @@ document.addEventListener("click", async ev => {
   if (a === "draft"){
     const m = b.dataset.mode;
     if (m === "replace") st.program.days = st.draft; else if (m === "add") st.program.days.push(...st.draft);
-    st.draft = null; render(); if (m !== "cancel"){ saveProgram(); toast("Программа сохранена"); } return;
+    st.draft = null; if (m !== "cancel") delete st.program.recs; render();
+    if (m !== "cancel"){ saveProgram(); toast("Программа сохранена, ИИ готовит рекомендации"); const c = conf.get(); if (c.url && c.password) getProgramRecs(); } return;
   }
+  if (a === "recs"){ getProgramRecs(); return; }
+  if (a === "recapply"){ const r = recFor(b.closest("[data-rec]").dataset.rec); if (r){ applyRec(r); saveProgram(); render(); toast("Применено в программе"); } return; }
+  if (a === "recswap"){ const from = b.closest("[data-rec]").dataset.rec, to = b.dataset.to; if (!confirm(`Заменить «${from}» на «${to}» во всей программе?`)) return; swapExercise(from, to); saveProgram(); render(); toast("Упражнение заменено"); return; }
+  if (a === "hpreset"){ const h = prof().health, n = b.dataset.n, i = h.findIndex(x => key(x.name) === key(n)); if (i >= 0) h.splice(i, 1); else h.push({ id: uid(), name: n, note: "" }); store.put(); render(); return; }
+  if (a === "hadd"){ const v = $("#hnew").value.trim(); if (!v) return; prof().health.push({ id: uid(), name: v, note: "" }); store.put(); render(); return; }
+  if (a === "hdel"){ const id = b.closest("[data-hid]").dataset.hid; prof().health = prof().health.filter(x => x.id !== id); store.put(); render(); return; }
   if (a === "addday"){ st.program.days.push({ id: uid(), name: `День ${st.program.days.length + 1}`, weekdays: [], exercises: [{ id: uid(), name: "", sets: 3, reps: "10", weight: null, note: "" }] }); render(); saveProgram(); return; }
   const dayEl = b.closest("[data-day]"), day = dayEl && st.program.days.find(d => d.id === dayEl.dataset.day);
   if (a === "delday" && day){ if (!confirm(`Удалить «${day.name}»? История тренировок останется.`)) return; st.program.days = st.program.days.filter(d => d !== day); render(); saveProgram(); return; }
@@ -1048,6 +1161,7 @@ document.addEventListener("click", async ev => {
 
 document.addEventListener("change", ev => {
   const el = ev.target;
+  if (el.matches("[data-hnote]")){ const it = prof().health.find(x => x.id === el.closest("[data-hid]").dataset.hid); if (it){ it.note = el.value.trim(); store.put(); } return; }
   if (el.dataset.act === "pickday"){ const wk = ensureWorkout(st.date); wk.dayId = el.value; delete wk.list; st.editEx = null; st.editSet = null; render(); saveWorkout(st.date); return; }
   if (el.dataset.act === "progex"){ st.progEx = el.value; render(); return; }
   if (el.id === "ttime"){ st.settings.time = el.value || "19:00"; saveSettings(); return; }
